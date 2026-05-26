@@ -1,0 +1,35 @@
+# Data — never commit raw or interim data
+data/raw/
+data/interim/
+data/processed/
+
+# Environment
+.env
+.env.local
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Output (optional — commit reports if you want them public)
+# reports/figures/
+# reports/tables/
