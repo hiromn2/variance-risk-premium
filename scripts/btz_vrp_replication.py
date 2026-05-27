@@ -27,7 +27,7 @@ Usage:
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import pandas_datareader.data as web
+from fredapi import Fred
 from scipy.stats import genpareto
 from scipy.optimize import minimize
 import statsmodels.api as sm
@@ -35,13 +35,20 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import warnings
 from datetime import datetime
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — saves to file instead of displaying
+import matplotlib.pyplot as plt
+import os
+fred = Fred(api_key=os.getenv("FRED_API_KEY"))
+
+matplotlib.use("Agg")
 
 warnings.filterwarnings("ignore")
 plt.rcParams.update({"figure.dpi": 130, "axes.spines.top": False,
                      "axes.spines.right": False, "font.size": 11})
 
-START = "1990-01-01"   # VIX history starts Jan 1990
-END   = datetime.today().strftime("%Y-%m-%d")
+START = "1990-01-01"
+END   = "2007-12-31"
 
 
 # ============================================================
@@ -113,37 +120,26 @@ def fetch_avix(start=START, end=END):
 
 
 def fetch_macro_controls(start=START, end=END):
-    """
-    All from FRED (free). No API key needed for basic access via pandas_datareader.
-    If you want a key for higher rate limits: pip install fredapi
-    and set FRED_API_KEY env variable.
-
-    Series:
-      GS10     — 10-year Treasury constant maturity rate
-      TB3MS    — 3-month Treasury bill secondary market rate
-      BAA      — Moody's BAA corporate bond yield
-      AAA      — Moody's AAA corporate bond yield
-    """
+    fred = Fred(api_key=os.getenv("FRED_API_KEY"))  # no API key needed for basic access
     series = {
-        "gs10":  "GS10",    # 10Y Treasury
-        "tb3m":  "TB3MS",   # 3M T-bill
-        "baa":   "BAA",     # BAA yield
-        "aaa":   "AAA",     # AAA yield
+        "gs10": "GS10",
+        "tb3m": "TB3MS",
+        "baa":  "BAA",
+        "aaa":  "AAA",
     }
     frames = {}
     for name, fred_id in series.items():
         try:
-            s = web.DataReader(fred_id, "fred", start, end).squeeze()
+            s = fred.get_series(fred_id, observation_start=start,
+                                observation_end=end)
             s.name = name
             frames[name] = s
         except Exception as e:
             print(f"FRED fetch failed for {fred_id}: {e}")
 
     macro = pd.DataFrame(frames)
-    # Derived spreads (in percentage points, as in BTZ)
-    macro["term_spread"]    = macro["gs10"] - macro["tb3m"]   # term premium
-    macro["default_spread"] = macro["baa"]  - macro["aaa"]    # credit premium
-    # FRED data is monthly; forward-fill within month is fine here
+    macro["term_spread"]    = macro["gs10"] - macro["tb3m"]
+    macro["default_spread"] = macro["baa"]  - macro["aaa"]
     return macro
 
 
@@ -170,6 +166,8 @@ def fetch_cape(start=START, end=END):
         df = df.dropna(subset=["Date"]).set_index("Date")
         # 10-year trailing average earnings
         df["E10"] = df["E"].rolling(120).mean()
+        df["P"]  = pd.to_numeric(df["P"],  errors="coerce")
+        df["E10"] = pd.to_numeric(df["E10"], errors="coerce")
         df["cape"] = np.log(df["P"] / df["E10"])
         cape = df["cape"].dropna()
         cape.index = cape.index.to_period("M").to_timestamp("M")
@@ -615,13 +613,12 @@ def oos_r2(panel: pd.DataFrame,
 
     oos_r2_val = 1 - e_model.mean() / e_bench.mean()
 
-    # Cumulative ΔMSE for significance testing (Clark-West style)
-    cum_dmse = np.cumsum(e_bench[valid] - e_model[valid])
+    cum_dmse = np.cumsum(e_bench - e_model)
 
     return {
         "OOS_R2": oos_r2_val,
         "cum_dmse": pd.Series(cum_dmse,
-                              index=df.index[valid][valid]),
+                              index=df.index[valid]),
         "N_eval": valid.sum(),
     }
 
@@ -700,8 +697,9 @@ def plot_vrp_series(panel: pd.DataFrame, save: bool = False):
 
     # Fetch NBER recession dates from FRED
     try:
-        rec = web.DataReader("USREC", "fred",
-                             panel.index.min(), panel.index.max()).squeeze()
+        fred = Fred(api_key=os.getenv("FRED_API_KEY"))
+        rec = fred.get_series("USREC", observation_start=panel.index.min(),
+                       observation_end=panel.index.max())
         rec = rec.reindex(panel.index, method="ffill").fillna(0)
     except Exception:
         rec = pd.Series(0, index=panel.index)

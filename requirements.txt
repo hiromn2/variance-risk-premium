@@ -3,7 +3,7 @@ pandas>=2.0
 numpy>=1.26
 scipy>=1.12
 statsmodels>=0.14
-pandas-datareader>=0.10
+pandas-datareader==0.10.0
 openpyxl>=3.1        # for Shiller CAPE Excel
 matplotlib>=3.8
 jupyter>=1.0
