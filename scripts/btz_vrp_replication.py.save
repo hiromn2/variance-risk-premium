@@ -1,6 +1,7 @@
-"""
+from fredapi import Fred"""
 Variance Risk Premium Replication & EVT Extension
-Based on: Bollerslev, Tauchen & Zhou (2009), RFS
+Based on: Bollerslev, Ta
+uchen & Zhou (2009), RFS
 Extension: EVT-corrected realized variance, motivated by Londono (2011) puzzle
 
 Structure:
@@ -27,7 +28,7 @@ Usage:
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from fredapi import Fred
+import pandas_datareader.data as web
 from scipy.stats import genpareto
 from scipy.optimize import minimize
 import statsmodels.api as sm
@@ -35,22 +36,13 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import warnings
 from datetime import datetime
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend — saves to file instead of displaying
-import matplotlib.pyplot as plt
-import os
-fred = Fred(api_key=os.getenv("FRED_API_KEY"))
-
-matplotlib.use("Agg")
 
 warnings.filterwarnings("ignore")
 plt.rcParams.update({"figure.dpi": 130, "axes.spines.top": False,
                      "axes.spines.right": False, "font.size": 11})
 
-START = "1990-01-01"
-END   = "2007-12-31"
-
-
+START = "1990-01-01"   # VIX history starts Jan 1990
+END   = datetime.today().strftime("%Y-%m-%d")
 
 
 # ============================================================
@@ -122,26 +114,37 @@ def fetch_avix(start=START, end=END):
 
 
 def fetch_macro_controls(start=START, end=END):
-    fred = Fred(api_key=os.getenv("FRED_API_KEY"))  # no API key needed for basic access
+    """
+    All from FRED (free). No API key needed for basic access via pandas_datareader.
+    If you want a key for higher rate limits: pip install fredapi
+    and set FRED_API_KEY env variable.
+
+    Series:
+      GS10     — 10-year Treasury constant maturity rate
+      TB3MS    — 3-month Treasury bill secondary market rate
+      BAA      — Moody's BAA corporate bond yield
+      AAA      — Moody's AAA corporate bond yield
+    """
     series = {
-        "gs10": "GS10",
-        "tb3m": "TB3MS",
-        "baa":  "BAA",
-        "aaa":  "AAA",
+        "gs10":  "GS10",    # 10Y Treasury
+        "tb3m":  "TB3MS",   # 3M T-bill
+        "baa":   "BAA",     # BAA yield
+        "aaa":   "AAA",     # AAA yield
     }
     frames = {}
     for name, fred_id in series.items():
         try:
-            s = fred.get_series(fred_id, observation_start=start,
-                                observation_end=end)
+            s = web.DataReader(fred_id, "fred", start, end).squeeze()
             s.name = name
             frames[name] = s
         except Exception as e:
             print(f"FRED fetch failed for {fred_id}: {e}")
 
     macro = pd.DataFrame(frames)
-    macro["term_spread"]    = macro["gs10"] - macro["tb3m"]
-    macro["default_spread"] = macro["baa"]  - macro["aaa"]
+    # Derived spreads (in percentage points, as in BTZ)
+    macro["term_spread"]    = macro["gs10"] - macro["tb3m"]   # term premium
+    macro["default_spread"] = macro["baa"]  - macro["aaa"]    # credit premium
+    # FRED data is monthly; forward-fill within month is fine here
     return macro
 
 
@@ -168,8 +171,6 @@ def fetch_cape(start=START, end=END):
         df = df.dropna(subset=["Date"]).set_index("Date")
         # 10-year trailing average earnings
         df["E10"] = df["E"].rolling(120).mean()
-        df["P"]  = pd.to_numeric(df["P"],  errors="coerce")
-        df["E10"] = pd.to_numeric(df["E10"], errors="coerce")
         df["cape"] = np.log(df["P"] / df["E10"])
         cape = df["cape"].dropna()
         cape.index = cape.index.to_period("M").to_timestamp("M")
@@ -344,7 +345,7 @@ def build_evt_rv(daily_returns: pd.Series,
             # (We replace each tail r² with its expectation under GPD)
             tail_rv = tail_days * (u**2 + tail_rv_analytical / max(n_exceed/n_obs*2, 1e-6))
 
-        evt_rv_list.append((body_rv + tail_rv) * 12)   # annualised   # annualise
+        evt_rv_list.append((body_rv + tail_rv) * 12)   # annualise
         evt_rv_dates.append(period.to_timestamp("M"))
 
     evt_rv = pd.Series(evt_rv_list, index=pd.DatetimeIndex(evt_rv_dates),
@@ -615,12 +616,13 @@ def oos_r2(panel: pd.DataFrame,
 
     oos_r2_val = 1 - e_model.mean() / e_bench.mean()
 
-    cum_dmse = np.cumsum(e_bench - e_model)
+    # Cumulative ΔMSE for significance testing (Clark-West style)
+    cum_dmse = np.cumsum(e_bench[valid] - e_model[valid])
 
     return {
         "OOS_R2": oos_r2_val,
         "cum_dmse": pd.Series(cum_dmse,
-                              index=df.index[valid]),
+                              index=df.index[valid][valid]),
         "N_eval": valid.sum(),
     }
 
@@ -699,9 +701,8 @@ def plot_vrp_series(panel: pd.DataFrame, save: bool = False):
 
     # Fetch NBER recession dates from FRED
     try:
-        fred = Fred(api_key=os.getenv("FRED_API_KEY"))
-        rec = fred.get_series("USREC", observation_start=panel.index.min(),
-                       observation_end=panel.index.max())
+        rec = web.DataReader("USREC", "fred",
+                             panel.index.min(), panel.index.max()).squeeze()
         rec = rec.reindex(panel.index, method="ffill").fillna(0)
     except Exception:
         rec = pd.Series(0, index=panel.index)
@@ -722,7 +723,6 @@ def plot_vrp_series(panel: pd.DataFrame, save: bool = False):
     if "EVT_VRP" in panel.columns:
         axes[0].plot(panel.index, panel["EVT_VRP"] * 10000, color="#EF9F27",
                      lw=0.9, alpha=0.7, linestyle="--", label="EVT-VRP")
-    axes[0].set_ylim(-500, 200)   # winsorise display, units are ×10⁴
     axes[0].axhline(0, color="black", lw=0.5, linestyle="--")
     add_recession_shading(axes[0], rec, panel.index)
     axes[0].set_ylabel("VRP (×10⁴)")
