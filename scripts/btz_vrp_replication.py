@@ -484,7 +484,15 @@ def hodrick_se(y: np.ndarray, X: np.ndarray, h: int) -> np.ndarray:
         S += G + G.T
 
     V = XtX_inv @ S @ XtX_inv / T
-    return np.sqrt(np.maximum(np.diag(V), 0.0))
+    diag = np.diag(V)
+
+    # Numerical guard:
+    # If the covariance diagonal is non-positive or non-finite, the
+    # corresponding standard error is not usable. Do not coerce to zero,
+    # because beta / 0 creates artificial infinite t-statistics.
+    diag = np.where((diag > 0) & np.isfinite(diag), diag, np.nan)
+
+    return np.sqrt(diag)
 
 
 # ============================================================
@@ -512,7 +520,12 @@ def vrp_predictability(
         X = sm.add_constant(df[reg_cols].values)
         beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
         se = hodrick_se(y, X, h)
-        t_stats = beta_hat / se
+        t_stats = np.divide(
+            beta_hat,
+            se,
+            out=np.full_like(beta_hat, np.nan, dtype=float),
+            where=(se > 0) & np.isfinite(se),
+        )
 
         y_hat = X @ beta_hat
         ss_res = np.sum((y - y_hat) ** 2)
@@ -635,7 +648,12 @@ def evt_horse_race(
         X = sm.add_constant(df[reg_cols].values)
         beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
         se = hodrick_se(y, X, h)
-        t_stats = beta_hat / se
+        t_stats = np.divide(
+            beta_hat,
+            se,
+            out=np.full_like(beta_hat, np.nan, dtype=float),
+            where=(se > 0) & np.isfinite(se),
+        )
 
         y_hat = X @ beta_hat
         r2 = 1.0 - np.sum((y - y_hat) ** 2) / np.sum((y - y.mean()) ** 2)
