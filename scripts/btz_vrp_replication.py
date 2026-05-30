@@ -495,6 +495,38 @@ def hodrick_se(y: np.ndarray, X: np.ndarray, h: int) -> np.ndarray:
     return np.sqrt(diag)
 
 
+
+def safe_tstats(beta_hat: np.ndarray, se: np.ndarray) -> np.ndarray:
+    """Safe beta / SE division: invalid SEs become NaN, not inf."""
+    beta_hat = np.asarray(beta_hat, dtype=float)
+    se = np.asarray(se, dtype=float)
+    return np.divide(
+        beta_hat,
+        se,
+        out=np.full_like(beta_hat, np.nan, dtype=float),
+        where=(se > 0) & np.isfinite(se),
+    )
+
+
+def hac_se(y: np.ndarray, X: np.ndarray, h: int) -> np.ndarray:
+    """
+    Newey-West / HAC standard errors as a robustness check.
+
+    For h-month overlapping returns, the natural HAC lag choice is h - 1.
+    This is not the main BTZ inference method, but a useful sanity check
+    against Hodrick-style standard errors.
+    """
+    y = np.asarray(y, dtype=float)
+    X = np.asarray(X, dtype=float)
+    lags = max(int(h) - 1, 0)
+
+    try:
+        model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": lags})
+        return np.asarray(model.bse, dtype=float)
+    except Exception:
+        return np.full(X.shape[1], np.nan)
+
+
 # ============================================================
 # 7. PREDICTABILITY REGRESSIONS
 # ============================================================
@@ -674,6 +706,65 @@ def evt_horse_race(
     return pd.DataFrame(results).set_index("horizon")
 
 
+
+def evt_horse_race_hac(
+    panel: pd.DataFrame,
+    horizons: Sequence[int] = (1, 3, 6),
+    controls: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """
+    HAC/Newey-West robustness version of the EVT horse-race.
+
+    Regression:
+        xret_{t,t+h} = a + b1 VRP_t + b2 DeltaVRP_t + controls + e
+
+    Uses Newey-West / HAC standard errors with maxlags = h - 1.
+    """
+    if "EVT_VRP" not in panel.columns:
+        print("EVT_VRP not available; run build_evt_rv first.")
+        return pd.DataFrame()
+
+    local = panel.copy()
+    local["delta_VRP"] = local["EVT_VRP"] - local["VRP"]
+    ctrl_cols = list(controls or [])
+    results: list[dict[str, object]] = []
+
+    for h in horizons:
+        dep = f"xret_{h}m" if f"xret_{h}m" in local.columns else f"ret_{h}m"
+        reg_cols = ["VRP", "delta_VRP"] + [c for c in ctrl_cols if c in local.columns]
+        df = local[[dep] + reg_cols].dropna()
+        if len(df) < 50:
+            continue
+
+        y = df[dep].values
+        X = sm.add_constant(df[reg_cols].values)
+        beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
+
+        se = hac_se(y, X, h)
+        t_stats = safe_tstats(beta_hat, se)
+
+        y_hat = X @ beta_hat
+        r2 = 1.0 - np.sum((y - y_hat) ** 2) / np.sum((y - y.mean()) ** 2)
+
+        results.append({
+            "horizon": h,
+            "beta_VRP": beta_hat[1],
+            "se_VRP_HAC": se[1],
+            "t_VRP_HAC": t_stats[1],
+            "beta_deltaVRP": beta_hat[2],
+            "se_deltaVRP_HAC": se[2],
+            "t_deltaVRP_HAC": t_stats[2],
+            "R2": r2,
+            "N": len(df),
+            "controls": ", ".join([c for c in ctrl_cols if c in local.columns]) or "none",
+            "hac_lags": max(int(h) - 1, 0),
+        })
+
+    if not results:
+        return pd.DataFrame()
+    return pd.DataFrame(results).set_index("horizon")
+
+
 # ============================================================
 # 10. OUTPUT HELPERS AND PLOTS
 # ============================================================
@@ -842,6 +933,15 @@ def run_validation_tables(panel: pd.DataFrame, sample: SampleSpec) -> dict[str, 
     print(res_evt.round(4).to_string() if not res_evt.empty else "Insufficient EVT/data.")
     save_table(res_evt, f"table3_evt_horserace_{sample.label}.csv")
 
+    res_evt_hac = evt_horse_race_hac(
+        p,
+        horizons=[1, 3, 6],
+        controls=["term_spread", "default_spread"],
+    )
+    print("\nTABLE 3 HAC/Newey-West robustness")
+    print(res_evt_hac.round(4).to_string() if not res_evt_hac.empty else "Insufficient EVT/data.")
+    save_table(res_evt_hac, f"table3_evt_horserace_HAC_{sample.label}.csv")
+
     oos = oos_r2(p, vrp_col="VRP", h=1, min_train=60, return_predictions=True)
     print("\nOOS R², h=1")
     if np.isfinite(oos["OOS_R2"]):
@@ -858,6 +958,7 @@ def run_validation_tables(panel: pd.DataFrame, sample: SampleSpec) -> dict[str, 
         "res_uni": res_uni,
         "res_ctrl": res_ctrl,
         "res_evt": res_evt,
+        "res_evt_hac": res_evt_hac,
         "oos": oos,
     }
 
