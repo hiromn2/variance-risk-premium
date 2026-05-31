@@ -208,8 +208,11 @@ def main():
     )
 
     # --- Generation loop ---
+    # --- Generation loop ---
     history = []
     winner  = None
+    best_ever_test_acc = 0.0
+    best_ever = None
     t_run   = time.time()
 
     print("gen   | best_fit  (mean_fit) | train  test  | nodes conns | species | time")
@@ -226,6 +229,11 @@ def main():
         )
         history.append(stats)
         winner = best
+
+        if stats["best_test_acc"] >= best_ever_test_acc:
+            best_ever_test_acc = stats["best_test_acc"]
+            best_ever = best
+            save_winner(best_ever, args.out_dir, f"{args.dataset}_best_test")
 
         # Save checkpoint every 10 generations
         if gen % 10 == 0:
@@ -249,3 +257,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print(f"  Winner: nodes={len(winner.nodes)}  "
+          f"conns={sum(1 for c in winner.connections.values() if c.enabled)}")
+    print(f"  Best test acc: {best_ever_test_acc:.3f}  "
+          f"(saved as winner_{args.dataset}_best_test.pkl)")

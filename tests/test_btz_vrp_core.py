@@ -90,3 +90,46 @@ def test_oos_r2_no_future_leakage_for_h3():
     for timestamp, row in preds.iterrows():
         t = panel.index.get_loc(timestamp)
         assert row["train_end_obs"] == t - 3 + 1
+
+
+def test_rolling_oos_r2_worse_post_2008():
+    """Rolling OOS R² is closer to zero (less negative) pre-2008 than post-2008.
+
+    Uses the cached panel so the test reflects the real data distribution.
+    The structural-break story requires pre-2008 OOS R² > post-2008 OOS R².
+    """
+    import pytest
+    parquet = Path(__file__).resolve().parents[1] / "data" / "processed" / "panel_us.parquet"
+    if not parquet.exists():
+        pytest.skip("panel_us.parquet not found; run the main pipeline first")
+
+    panel = pd.read_parquet(parquet).sort_index()
+    pre = panel.loc[:"2007-12-31"]
+    post = panel.loc["2008-01-01":]
+
+    r2_pre = btz.rolling_oos_r2(pre, vrp_col="VRP", h=1, window=60)
+    r2_post = btz.rolling_oos_r2(post, vrp_col="VRP", h=1, window=60)
+
+    assert np.isfinite(r2_pre["OOS_R2_full"]), "pre-2008 OOS R² is NaN — not enough data"
+    assert np.isfinite(r2_post["OOS_R2_full"]), "post-2008 OOS R² is NaN — not enough data"
+    assert r2_pre["OOS_R2_full"] > r2_post["OOS_R2_full"], (
+        f"Expected pre-2008 OOS R² ({r2_pre['OOS_R2_full']:.4f}) > "
+        f"post-2008 ({r2_post['OOS_R2_full']:.4f})"
+    )
+
+
+def test_gpd_second_moment_monotone_in_xi():
+    """Larger ξ (heavier tail) implies larger conditional second moment, β and u fixed.
+
+    Validates theoretical monotonicity: as ξ ↑ toward 0.5, both E[y] and E[y²]
+    increase, so the EVT correction assigns more variance to tail days in
+    high-ξ regimes — which is the intended behavior of the tail correction.
+    """
+    beta, u = 0.01, 0.02
+    xis = [0.0, 0.1, 0.2, 0.3, 0.4]
+    moments = [btz.gpd_conditional_second_moment(xi, beta, u) for xi in xis]
+
+    assert all(np.isfinite(m) for m in moments), "Some moments are NaN for valid ξ < 0.5"
+    assert all(m1 < m2 for m1, m2 in zip(moments, moments[1:])), (
+        f"Moments not strictly increasing with ξ: {list(zip(xis, moments))}"
+    )

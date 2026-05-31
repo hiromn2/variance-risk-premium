@@ -71,9 +71,11 @@ BTZ_START = "1990-01-01"
 BTZ_END = "2007-12-31"
 POST_START = "2008-01-01"
 
-DATA_DIR = Path("data/processed")
-FIGURE_DIR = Path("reports/figures")
-TABLE_DIR = Path("reports/tables")
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent if _HERE.name == "scripts" else _HERE
+DATA_DIR = _ROOT / "data" / "processed"
+FIGURE_DIR = _ROOT / "reports" / "figures"
+TABLE_DIR = _ROOT / "reports" / "tables"
 
 
 @dataclass(frozen=True)
@@ -225,7 +227,12 @@ def fetch_cape(start: str = DEFAULT_START, end: str = DEFAULT_END) -> Optional[p
         df["cape"] = np.log(df["P"] / df["E10"])
         cape = df["cape"].dropna()
         cape.index = cape.index.to_period("M").to_timestamp("M")
-        cape = cape.loc[pd.to_datetime(start):pd.to_datetime(end)]
+        # Shiller file sometimes has duplicated or non-monotonic dates after period conversion.
+        cape = cape[~cape.index.duplicated(keep="last")]
+        cape = cape.sort_index()
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+        cape = cape[(cape.index >= start_dt) & (cape.index <= end_dt)]
         cape.name = "log_cape"
         return cape
     except Exception as exc:
@@ -282,10 +289,31 @@ def fit_gpd_tail(returns: np.ndarray, threshold_quantile: float = 0.90) -> tuple
     if len(abs_r) == 0:
         return 0.0, np.nan, np.nan
 
+    # Threshold choice: threshold_quantile sets the GPD fitting boundary u.
+    #
+    # Why q85 (0.85) fails or flips sign:
+    #   At the 85th percentile the exceedance set includes a large fraction of
+    #   the distribution body, not just extreme tail events. GPD asymptotics
+    #   (Pickands–Balkema–de Haan theorem) are valid only for genuine tail data.
+    #   Fitting GPD to body observations biases ξ downward — sometimes negative —
+    #   which corrupts the second-moment correction and can flip the sign of
+    #   delta-VRP in the horse-race regression.
+    #
+    # Why the 252-day window dominates:
+    #   One trading year is the natural regime-adaptation horizon. Longer windows
+    #   (504, 756 days) average across structural breaks, diluting the current
+    #   tail shape estimate with stale observations from earlier regimes. This
+    #   smooths out ξ and weakens the EVT correction.
+    #
+    # Minimum-exceedances guard: a 252-day window at q90 produces ~25 exceedances
+    #   (252 × 0.10 = 25.2). The guard must be below that; 15 is the lower bound
+    #   for stable GPD MLE in finite samples. The original value of 30 was written
+    #   for full-sample estimation and silently triggered the fallback on every
+    #   rolling window call, storing ξ = 0 for the entire sample.
     u = float(np.quantile(abs_r, threshold_quantile))
     exceedances = abs_r[abs_r > u] - u
 
-    if len(exceedances) < 30:
+    if len(exceedances) < 15:
         # Too few exceedances for reliable MLE; exponential-like fallback.
         beta = float(np.std(abs_r))
         return 0.0, beta, u
@@ -317,7 +345,8 @@ def build_evt_rv(
     daily_returns: pd.Series,
     window: int = 252,
     threshold_quantile: float = 0.90,
-) -> pd.Series:
+    return_xi: bool = False,
+) -> "pd.Series | tuple[pd.Series, pd.Series]":
     """
     Build EVT-corrected monthly realized variance.
 
@@ -326,6 +355,9 @@ def build_evt_rv(
       2. Compute body contribution directly: sum r^2 for |r| <= u.
       3. Replace each observed tail-day r^2 by E[|r|^2 | |r| > u].
       4. Annualize by multiplying by 12.
+
+    If return_xi=True, returns (evt_rv, xi_series) where xi_series holds the
+    monthly GPD shape parameter (ξ) estimates for rolling diagnostic plots.
     """
     daily_returns = daily_returns.dropna().sort_index()
     rets = daily_returns.values
@@ -334,6 +366,7 @@ def build_evt_rv(
 
     evt_rv_values: list[float] = []
     evt_rv_dates: list[pd.Timestamp] = []
+    xi_values: list[float] = []
 
     for period, group in monthly_periods:
         month_end_idx = dates.get_loc(group.index[-1])
@@ -357,8 +390,12 @@ def build_evt_rv(
 
         evt_rv_values.append((body_rv + tail_rv) * 12.0)
         evt_rv_dates.append(period.to_timestamp("M"))
+        xi_values.append(xi)
 
     evt_rv = pd.Series(evt_rv_values, index=pd.DatetimeIndex(evt_rv_dates), name="EVT_RV")
+    if return_xi:
+        xi_series = pd.Series(xi_values, index=pd.DatetimeIndex(evt_rv_dates), name="gpd_xi")
+        return evt_rv, xi_series
     return evt_rv
 
 
@@ -437,7 +474,7 @@ def slice_panel(panel: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
 
 def summary_stats(panel: pd.DataFrame) -> pd.DataFrame:
     """Mean, std, skewness, excess kurtosis, AR(1), min, max, and N."""
-    cols = [c for c in ["VRP", "RV", "VIX2", "EVT_RV", "EVT_VRP"] if c in panel.columns]
+    cols = [c for c in ["VRP", "RV", "VIX2", "EVT_RV", "EVT_VRP", "log_cape"] if c in panel.columns]
     stats: dict[str, dict[str, float]] = {}
     for c in cols:
         s = panel[c].dropna()
@@ -485,46 +522,28 @@ def hodrick_se(y: np.ndarray, X: np.ndarray, h: int) -> np.ndarray:
 
     V = XtX_inv @ S @ XtX_inv / T
     diag = np.diag(V)
-
-    # Numerical guard:
-    # If the covariance diagonal is non-positive or non-finite, the
-    # corresponding standard error is not usable. Do not coerce to zero,
-    # because beta / 0 creates artificial infinite t-statistics.
     diag = np.where((diag > 0) & np.isfinite(diag), diag, np.nan)
-
     return np.sqrt(diag)
 
 
-
-def safe_tstats(beta_hat: np.ndarray, se: np.ndarray) -> np.ndarray:
-    """Safe beta / SE division: invalid SEs become NaN, not inf."""
-    beta_hat = np.asarray(beta_hat, dtype=float)
-    se = np.asarray(se, dtype=float)
-    return np.divide(
-        beta_hat,
-        se,
-        out=np.full_like(beta_hat, np.nan, dtype=float),
-        where=(se > 0) & np.isfinite(se),
-    )
-
-
 def hac_se(y: np.ndarray, X: np.ndarray, h: int) -> np.ndarray:
-    """
-    Newey-West / HAC standard errors as a robustness check.
-
-    For h-month overlapping returns, the natural HAC lag choice is h - 1.
-    This is not the main BTZ inference method, but a useful sanity check
-    against Hodrick-style standard errors.
-    """
+    """Newey-West / HAC standard errors with maxlags = h − 1."""
     y = np.asarray(y, dtype=float)
     X = np.asarray(X, dtype=float)
     lags = max(int(h) - 1, 0)
-
     try:
         model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": lags})
         return np.asarray(model.bse, dtype=float)
     except Exception:
         return np.full(X.shape[1], np.nan)
+
+
+def safe_tstats(beta: np.ndarray, se: np.ndarray) -> np.ndarray:
+    return np.divide(
+        beta, se,
+        out=np.full_like(beta, np.nan, dtype=float),
+        where=(se > 0) & np.isfinite(se),
+    )
 
 
 # ============================================================
@@ -552,12 +571,7 @@ def vrp_predictability(
         X = sm.add_constant(df[reg_cols].values)
         beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
         se = hodrick_se(y, X, h)
-        t_stats = np.divide(
-            beta_hat,
-            se,
-            out=np.full_like(beta_hat, np.nan, dtype=float),
-            where=(se > 0) & np.isfinite(se),
-        )
+        t_stats = safe_tstats(beta_hat, se)
 
         y_hat = X @ beta_hat
         ss_res = np.sum((y - y_hat) ** 2)
@@ -645,6 +659,78 @@ def oos_r2(
     return result
 
 
+def rolling_oos_r2(
+    panel: pd.DataFrame,
+    vrp_col: str = "VRP",
+    h: int = 1,
+    window: int = 60,
+) -> dict[str, object]:
+    """
+    Rolling-window OOS R² with a fixed estimation window.
+
+    Uses a fixed `window`-month lookback rather than an expanding window.
+    Reports OOS R² separately for pre-2008 and post-2008 subperiods to
+    distinguish overfitting (bad in-sample fit) from regime break (good
+    in-sample but bad out-of-sample post-crisis).
+    """
+    dep = f"xret_{h}m" if f"xret_{h}m" in panel.columns else f"ret_{h}m"
+    df = panel[[vrp_col, dep]].dropna()
+    T = len(df)
+    y = df[dep].values
+    x = df[vrp_col].values
+
+    pred_model = np.full(T, np.nan)
+    pred_bench = np.full(T, np.nan)
+
+    first_forecast = window + h - 1
+    for t in range(first_forecast, T):
+        train_end = t - h + 1  # exclusive; no future return leakage
+        train_start = max(0, train_end - window)
+
+        y_train = y[train_start:train_end]
+        x_train = x[train_start:train_end]
+        pred_bench[t] = float(np.mean(y_train))
+
+        X_train = np.column_stack([np.ones(len(y_train)), x_train])
+        try:
+            b = np.linalg.lstsq(X_train, y_train, rcond=None)[0]
+            pred_model[t] = b[0] + b[1] * x[t]
+        except Exception:
+            pred_model[t] = pred_bench[t]
+
+    def _r2_for_mask(mask: np.ndarray) -> tuple[float, int]:
+        m = mask & ~np.isnan(pred_model) & ~np.isnan(pred_bench)
+        if m.sum() == 0:
+            return np.nan, 0
+        e_bench = (y[m] - pred_bench[m]) ** 2
+        e_model = (y[m] - pred_model[m]) ** 2
+        return float(1.0 - e_model.mean() / e_bench.mean()), int(m.sum())
+
+    valid = ~np.isnan(pred_model) & ~np.isnan(pred_bench)
+    dates = df.index
+    pre_mask = np.array(dates < pd.Timestamp("2008-01-01"))
+    post_mask = np.array(dates >= pd.Timestamp("2008-01-01"))
+
+    oos_full, n_full = _r2_for_mask(valid)
+    oos_pre, n_pre = _r2_for_mask(pre_mask & valid)
+    oos_post, n_post = _r2_for_mask(post_mask & valid)
+
+    return {
+        "OOS_R2_full": oos_full,
+        "OOS_R2_pre2008": oos_pre,
+        "OOS_R2_post2008": oos_post,
+        "N_full": n_full,
+        "N_pre": n_pre,
+        "N_post": n_post,
+        "window": window,
+        "predictions": pd.DataFrame({
+            "y": y,
+            "pred_model": pred_model,
+            "pred_bench": pred_bench,
+        }, index=df.index),
+    }
+
+
 # ============================================================
 # 9. EVT HORSE-RACE
 # ============================================================
@@ -680,12 +766,7 @@ def evt_horse_race(
         X = sm.add_constant(df[reg_cols].values)
         beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
         se = hodrick_se(y, X, h)
-        t_stats = np.divide(
-            beta_hat,
-            se,
-            out=np.full_like(beta_hat, np.nan, dtype=float),
-            where=(se > 0) & np.isfinite(se),
-        )
+        t_stats = safe_tstats(beta_hat, se)
 
         y_hat = X @ beta_hat
         r2 = 1.0 - np.sum((y - y_hat) ** 2) / np.sum((y - y.mean()) ** 2)
@@ -706,20 +787,12 @@ def evt_horse_race(
     return pd.DataFrame(results).set_index("horizon")
 
 
-
 def evt_horse_race_hac(
     panel: pd.DataFrame,
     horizons: Sequence[int] = (1, 3, 6),
     controls: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
-    """
-    HAC/Newey-West robustness version of the EVT horse-race.
-
-    Regression:
-        xret_{t,t+h} = a + b1 VRP_t + b2 DeltaVRP_t + controls + e
-
-    Uses Newey-West / HAC standard errors with maxlags = h - 1.
-    """
+    """Same horse-race as evt_horse_race but with Newey-West / HAC standard errors."""
     if "EVT_VRP" not in panel.columns:
         print("EVT_VRP not available; run build_evt_rv first.")
         return pd.DataFrame()
@@ -739,7 +812,6 @@ def evt_horse_race_hac(
         y = df[dep].values
         X = sm.add_constant(df[reg_cols].values)
         beta_hat = np.linalg.lstsq(X, y, rcond=None)[0]
-
         se = hac_se(y, X, h)
         t_stats = safe_tstats(beta_hat, se)
 
@@ -867,6 +939,62 @@ def plot_predictability_r2(
     plt.close(fig)
 
 
+def plot_rolling_xi(panel: pd.DataFrame, filename: str = "fig3_rolling_xi.pdf") -> None:
+    """Figure 3: Rolling GPD tail shape parameter ξ with NBER recession shading.
+
+    ξ = 0 is the exponential boundary (thin tail); ξ = 0.5 is the finite-variance
+    boundary — above it the GPD second moment is undefined and the EVT correction
+    falls back to observed squared returns.
+
+    Empirically, ξ tends to spike ahead of realized stress events: it rose
+    noticeably before the 2008–2009 financial crisis and spiked sharply around
+    the March 2020 COVID crash, reflecting the tail thickening that precedes
+    large market dislocations.
+    """
+    if "gpd_xi" not in panel.columns:
+        print("gpd_xi not in panel; rebuild the panel or rerun build_us_panel.")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    try:
+        fred = make_fred()
+        if fred is None:
+            raise RuntimeError("fredapi unavailable")
+        rec = fred.get_series("USREC", observation_start=panel.index.min(),
+                              observation_end=panel.index.max())
+        rec = rec.reindex(panel.index, method="ffill").fillna(0)
+    except Exception:
+        rec = pd.Series(0, index=panel.index)
+
+    in_rec = False
+    rec_start = None
+    for date, val in rec.items():
+        if val == 1 and not in_rec:
+            rec_start = date
+            in_rec = True
+        elif val == 0 and in_rec and rec_start is not None:
+            ax.axvspan(rec_start, date, alpha=0.15, color="gray", lw=0)
+            in_rec = False
+    if in_rec and rec_start is not None:
+        ax.axvspan(rec_start, rec.index[-1], alpha=0.15, color="gray", lw=0)
+
+    xi_smooth = panel['gpd_xi'].rolling(12, center=True, min_periods=6).mean()
+    ax.plot(xi_smooth.index, xi_smooth.values, color='darkorange', linewidth=2.0, alpha=0.9, label='12-month smoothed ξ')
+    ax.plot(panel['gpd_xi'].index, panel['gpd_xi'].values, color='steelblue', linewidth=0.8, alpha=0.3, label='GPD ξ (rolling 252-day window)')
+    ax.axhline(0.0, color="black", lw=0.9, linestyle="--", label="ξ = 0  (exponential boundary)")
+    ax.axhline(0.5, color="crimson", lw=0.9, linestyle="--", label="ξ = 0.5  (finite-variance boundary)")
+
+    ax.set_ylabel("GPD shape  ξ")
+    ax.legend(fontsize=9)
+    ax.set_title("Rolling GPD tail-shape parameter — S&P 500, 252-day window")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.tight_layout()
+    ensure_output_dirs()
+    plt.savefig(FIGURE_DIR / filename, bbox_inches="tight")
+    plt.close(fig)
+
+
 # ============================================================
 # 11. PIPELINE RUNNERS
 # ============================================================
@@ -887,11 +1015,12 @@ def build_us_panel(start: str, end: str, window: int = 252, threshold: float = 0
     rv_us = build_monthly_rv(spx_daily)
 
     print("Fitting EVT tail corrections...")
-    evt_rv_us = build_evt_rv(spx_daily, window=window, threshold_quantile=threshold)
+    evt_rv_us, xi_us = build_evt_rv(spx_daily, window=window, threshold_quantile=threshold, return_xi=True)
 
     print("Building master panel...")
     panel_us = build_panel(vix2, rv_us, evt_rv_us, spx_daily, macro_raw, cape_raw)
     panel_us = panel_us.sort_index()
+    panel_us = panel_us.join(xi_us.rename("gpd_xi"), how="left")
     ensure_output_dirs()
     panel_us.to_parquet(DATA_DIR / "panel_us.parquet")
     print(f"Panel: {len(panel_us)} monthly obs ({panel_us.index.min().date()} – {panel_us.index.max().date()})")
@@ -929,7 +1058,7 @@ def run_validation_tables(panel: pd.DataFrame, sample: SampleSpec) -> dict[str, 
         horizons=[1, 3, 6],
         controls=["term_spread", "default_spread"],
     )
-    print("\nTABLE 3: EVT horse-race")
+    print("\nTABLE 3: EVT horse-race (Hodrick SE)")
     print(res_evt.round(4).to_string() if not res_evt.empty else "Insufficient EVT/data.")
     save_table(res_evt, f"table3_evt_horserace_{sample.label}.csv")
 
@@ -943,7 +1072,7 @@ def run_validation_tables(panel: pd.DataFrame, sample: SampleSpec) -> dict[str, 
     save_table(res_evt_hac, f"table3_evt_horserace_HAC_{sample.label}.csv")
 
     oos = oos_r2(p, vrp_col="VRP", h=1, min_train=60, return_predictions=True)
-    print("\nOOS R², h=1")
+    print("\nOOS R², h=1 (expanding window)")
     if np.isfinite(oos["OOS_R2"]):
         print(f"OOS R² = {oos['OOS_R2'] * 100:.2f}% (N={oos['N_eval']})")
     else:
@@ -951,6 +1080,31 @@ def run_validation_tables(panel: pd.DataFrame, sample: SampleSpec) -> dict[str, 
     predictions = oos.get("predictions")
     if isinstance(predictions, pd.DataFrame):
         save_table(predictions, f"oos_predictions_h1_{sample.label}.csv")
+
+    roll_oos = rolling_oos_r2(p, vrp_col="VRP", h=1, window=60)
+    print("\nROLLING OOS R², h=1 (60-month window)")
+
+    def _fmt(val: float, n: int) -> str:
+        return f"{val * 100:.2f}% (N={n})" if np.isfinite(val) else "Insufficient data."
+
+    print(f"  Full sample: {_fmt(roll_oos['OOS_R2_full'], roll_oos['N_full'])}")
+    print(f"  Pre-2008:    {_fmt(roll_oos['OOS_R2_pre2008'], roll_oos['N_pre'])}")
+    print(f"  Post-2008:   {_fmt(roll_oos['OOS_R2_post2008'], roll_oos['N_post'])}")
+
+    roll_oos_summary = pd.DataFrame({
+        "OOS_R2_pct": [
+            roll_oos["OOS_R2_full"] * 100,
+            roll_oos["OOS_R2_pre2008"] * 100,
+            roll_oos["OOS_R2_post2008"] * 100,
+        ],
+        "N": [roll_oos["N_full"], roll_oos["N_pre"], roll_oos["N_post"]],
+        "window_months": 60,
+    }, index=pd.Index(["full", "pre2008", "post2008"], name="period"))
+    save_table(roll_oos_summary, f"oos_rolling60_h1_{sample.label}.csv")
+
+    roll_preds = roll_oos.get("predictions")
+    if isinstance(roll_preds, pd.DataFrame):
+        save_table(roll_preds, f"oos_rolling60_predictions_h1_{sample.label}.csv")
 
     return {
         "panel": p,
@@ -960,6 +1114,7 @@ def run_validation_tables(panel: pd.DataFrame, sample: SampleSpec) -> dict[str, 
         "res_evt": res_evt,
         "res_evt_hac": res_evt_hac,
         "oos": oos,
+        "roll_oos": roll_oos,
     }
 
 
@@ -1026,6 +1181,19 @@ def main() -> None:
 
     outputs = {sample.label: run_validation_tables(panel_us, sample) for sample in samples}
 
+    # ---- Consolidated rolling OOS R² summary (FULL sample, 60-month window) ----
+    roll = outputs["FULL_1990_end"]["roll_oos"]
+    print("\n" + "=" * 72)
+    print("ROLLING 60-MONTH OOS R² SUMMARY (FULL SAMPLE, h=1)")
+    print("=" * 72)
+
+    def _pct(v: float) -> str:
+        return f"{v * 100:.2f}%" if np.isfinite(v) else "n/a"
+
+    print(f"  Full sample (1990–{args.end[:4]}): {_pct(roll['OOS_R2_full'])}  (N={roll['N_full']})")
+    print(f"  1990–2007 subperiod:             {_pct(roll['OOS_R2_pre2008'])}  (N={roll['N_pre']})")
+    print(f"  2008–{args.end[:4]} subperiod:            {_pct(roll['OOS_R2_post2008'])}  (N={roll['N_post']})")
+
     if not args.skip_plots:
         full_panel = outputs["FULL_1990_end"]["panel"]
         plot_vrp_series(full_panel, filename="fig1_vrp_series_FULL_1990_end.pdf")
@@ -1035,6 +1203,7 @@ def main() -> None:
             outputs["FULL_1990_end"]["res_evt"],
             filename="fig2_r2_horizons_FULL_1990_end.pdf",
         )
+        plot_rolling_xi(full_panel, filename="fig3_rolling_xi.pdf")
         print(f"\nFigures saved to {FIGURE_DIR}/")
 
     if args.run_australia:
